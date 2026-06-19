@@ -9,7 +9,8 @@ const headers = {
   Authorization: `Basic ${Buffer.from(':' + PAT).toString('base64')}`,
 };
 
-const api = (path: string) => `${ORG}/${PROJECT}/_apis/${path}`;
+const baseUrl = ORG.startsWith('http') ? ORG : `https://dev.azure.com/${ORG}`;
+const api = (path: string) => `${baseUrl}/${PROJECT}/_apis/${path}`;
 
 async function adoFetch(url: string, opts?: RequestInit) {
   const res = await fetch(url, { ...opts, headers: { ...headers, ...opts?.headers } });
@@ -31,14 +32,42 @@ export interface WorkItem {
   url: string;
 }
 
-// Query stories and bugs under TecOrder\Returns, from the sprint that has "demo" tagged items onward
-export async function getStories(): Promise<WorkItem[]> {
+export interface SprintInfo {
+  path: string;
+  name: string;
+  number: number;
+}
+
+// Get list of iterations under TecOrder\Returns
+export async function getSprints(): Promise<SprintInfo[]> {
+  const data = await adoFetch(api(`wit/classificationnodes/Iterations/Returns?$depth=1&api-version=7.1`));
+  const children: any[] = data.children || [];
+  const sprints: SprintInfo[] = children
+    .filter((c: any) => /^Sprint \d+$/.test(c.name))
+    .map((c: any) => {
+      const match = c.name.match(/Sprint (\d+)/);
+      return { path: `${PROJECT}\\Returns\\${c.name}`, name: c.name, number: match ? parseInt(match[1]) : 0 };
+    })
+    .sort((a, b) => a.number - b.number);
+  return sprints;
+}
+
+// Get current iteration
+export async function getCurrentIteration(): Promise<string> {
+  const data = await adoFetch(api(`work/teamsettings/iterations?$timeframe=current&api-version=7.1`));
+  if (data.value && data.value.length) return data.value[0].path;
+  return '';
+}
+
+// Get stories/bugs for a specific sprint
+export async function getStoriesForSprint(sprintPath: string): Promise<WorkItem[]> {
+  const areaPath = `${PROJECT}\\Returns`;
   const wiql = `
     SELECT [System.Id]
     FROM WorkItems
     WHERE [System.WorkItemType] IN ('User Story', 'Bug')
-      AND [System.AreaPath] UNDER 'TecOrder\\Returns'
-      AND [System.IterationPath] UNDER 'TecOrder\\Returns'
+      AND [System.AreaPath] UNDER '${areaPath}'
+      AND [System.IterationPath] = '${sprintPath.replace(/'/g, "''")}'
     ORDER BY [Microsoft.VSTS.Common.BacklogPriority] ASC
   `;
 
@@ -51,15 +80,64 @@ export async function getStories(): Promise<WorkItem[]> {
   if (!ids.length) return [];
 
   const items = await getWorkItemsBatch(ids);
-  const allItems = await Promise.all(items.map(parseWorkItem));
 
-  // Find lowest sprint that has "demo" tag
-  const demoSprints = allItems.filter(i => i.tags.includes('demo')).map(i => i.sprintNumber);
-  const minDemoSprint = demoSprints.length ? Math.min(...demoSprints) : 0;
+  // Collect all child IDs
+  const allChildIds: number[] = [];
+  for (const raw of items) {
+    const childLinks = (raw.relations || []).filter(
+      (r: any) => r.rel === 'System.LinkTypes.Hierarchy-Forward'
+    );
+    for (const link of childLinks) {
+      const parts = link.url.split('/');
+      allChildIds.push(parseInt(parts[parts.length - 1]));
+    }
+  }
 
-  return allItems
-    .filter(i => i.sprintNumber >= minDemoSprint)
-    .sort((a, b) => a.sprintNumber - b.sprintNumber || a.boardPriority - b.boardPriority);
+  // Batch-fetch all children
+  const childrenMap = new Map<number, any>();
+  if (allChildIds.length) {
+    const children = await getWorkItemsBatch(allChildIds);
+    for (const child of children) childrenMap.set(child.id, child);
+  }
+
+  // Parse and resolve developers
+  const allItems: WorkItem[] = [];
+  for (const raw of items) {
+    const item = parseWorkItem(raw);
+    item.developer = resolveDeveloper(item, raw.relations || [], childrenMap);
+    allItems.push(item);
+  }
+
+  return allItems.sort((a, b) => a.boardPriority - b.boardPriority);
+}
+
+// Find which sprints have the "demo" tag (to identify previous demo sprint)
+export async function getDemoSprintNumber(): Promise<number> {
+  const areaPath = `${PROJECT}\\Returns`;
+  const wiql = `
+    SELECT [System.Id]
+    FROM WorkItems
+    WHERE [System.WorkItemType] IN ('User Story', 'Bug')
+      AND [System.AreaPath] UNDER '${areaPath}'
+      AND [System.Tags] CONTAINS 'demo'
+  `;
+
+  const result = await adoFetch(api('wit/wiql?api-version=7.1'), {
+    method: 'POST',
+    body: JSON.stringify({ query: wiql }),
+  });
+
+  const ids: number[] = result.workItems.map((w: { id: number }) => w.id);
+  if (!ids.length) return 0;
+
+  const items = await getWorkItemsBatch(ids);
+  let min = Infinity;
+  for (const raw of items) {
+    const iterPath: string = raw.fields['System.IterationPath'] || '';
+    const match = iterPath.match(/Sprint (\d+)/i);
+    if (match) min = Math.min(min, parseInt(match[1]));
+  }
+  return min === Infinity ? 0 : min;
 }
 
 async function getWorkItemsBatch(ids: number[]) {
@@ -70,25 +148,17 @@ async function getWorkItemsBatch(ids: number[]) {
   for (const chunk of chunks) {
     const data = await adoFetch(api('wit/workitemsbatch?api-version=7.1'), {
       method: 'POST',
-      body: JSON.stringify({
-        ids: chunk,
-        fields: [
-          'System.Id', 'System.Title', 'System.WorkItemType',
-          'System.State', 'System.Tags', 'System.IterationPath',
-          'Microsoft.VSTS.Common.BacklogPriority', 'System.AssignedTo',
-        ],
-        $expand: 'relations',
-      }),
+      body: JSON.stringify({ ids: chunk, $expand: 'relations' }),
     });
     results.push(...data.value);
   }
   return results;
 }
 
-async function parseWorkItem(raw: any): Promise<WorkItem> {
+function parseWorkItem(raw: any): WorkItem {
   const fields = raw.fields;
   const iterPath: string = fields['System.IterationPath'] || '';
-  const sprintMatch = iterPath.match(/Sprint-(\d+)/i);
+  const sprintMatch = iterPath.match(/Sprint (\d+)/i);
   const tags = (fields['System.Tags'] || '').split(';').map((t: string) => t.trim().toLowerCase()).filter(Boolean);
 
   return {
@@ -101,13 +171,12 @@ async function parseWorkItem(raw: any): Promise<WorkItem> {
     sprintNumber: sprintMatch ? parseInt(sprintMatch[1]) : 0,
     boardPriority: fields['Microsoft.VSTS.Common.BacklogPriority'] || 999999,
     assignedTo: fields['System.AssignedTo']?.displayName || '',
-    developer: '', // resolved later via subtasks
-    url: `${ORG}/${PROJECT}/_workitems/edit/${raw.id}`,
+    developer: '',
+    url: `${baseUrl}/${PROJECT}/_workitems/edit/${raw.id}`,
   };
 }
 
-// Get developer from subtasks (type Task, look for bug fix / tech design activity)
-export async function resolveDeveloper(item: WorkItem, relations: any[]): Promise<string> {
+function resolveDeveloper(item: WorkItem, relations: any[], childrenMap: Map<number, any>): string {
   const childLinks = (relations || []).filter(
     (r: any) => r.rel === 'System.LinkTypes.Hierarchy-Forward'
   );
@@ -118,10 +187,10 @@ export async function resolveDeveloper(item: WorkItem, relations: any[]): Promis
     return parseInt(parts[parts.length - 1]);
   });
 
-  const children = await getWorkItemsBatch(childIds);
-  const tasks = children.filter((c: any) => c.fields['System.WorkItemType'] === 'Task');
+  const tasks = childIds
+    .map(id => childrenMap.get(id))
+    .filter((c: any) => c && c.fields['System.WorkItemType'] === 'Task');
 
-  // Prefer tasks with development-related activity
   for (const task of tasks) {
     const activity: string = (task.fields['Microsoft.VSTS.Common.Activity'] || '').toLowerCase();
     if (activity === 'development' || activity === 'design') {
@@ -129,7 +198,6 @@ export async function resolveDeveloper(item: WorkItem, relations: any[]): Promis
     }
   }
 
-  // Fallback: any task's assigned to
   for (const task of tasks) {
     if (task.fields['System.AssignedTo']?.displayName) {
       return task.fields['System.AssignedTo'].displayName;
@@ -139,17 +207,47 @@ export async function resolveDeveloper(item: WorkItem, relations: any[]): Promis
   return item.assignedTo;
 }
 
-// Get full work items with relations to resolve developers
-export async function getStoriesWithDevelopers(): Promise<WorkItem[]> {
+// Main function: get stories for demo planning
+// Shows: stories from the highest sprint that has demo tag (excluding already-demoed) + all subsequent sprints up to current
+export async function getStoriesForDemo(): Promise<WorkItem[]> {
+  const areaPath = `${PROJECT}\\Returns`;
+
+  // Step 1: Find the highest sprint number that has demo-tagged items (last demo sprint)
+  const demoWiql = `
+    SELECT [System.Id]
+    FROM WorkItems
+    WHERE [System.WorkItemType] IN ('User Story', 'Bug')
+      AND [System.AreaPath] UNDER '${areaPath}'
+      AND [System.Tags] CONTAINS 'demo'
+  `;
+  const demoResult = await adoFetch(api('wit/wiql?api-version=7.1'), {
+    method: 'POST',
+    body: JSON.stringify({ query: demoWiql }),
+  });
+
+  const demoIds: number[] = demoResult.workItems.map((w: { id: number }) => w.id);
+  if (!demoIds.length) return [];
+
+  // Fetch demo items to find max sprint
+  const demoRaw = await getWorkItemsBatch(demoIds);
+  let maxDemoSprint = 0;
+  for (const raw of demoRaw) {
+    const iterPath: string = raw.fields['System.IterationPath'] || '';
+    const match = iterPath.match(/Sprint (\d+)/i);
+    if (match) maxDemoSprint = Math.max(maxDemoSprint, parseInt(match[1]));
+  }
+
+  if (!maxDemoSprint) return [];
+
+  // Step 2: Query all stories under Returns iteration, then filter to maxDemoSprint onward
   const wiql = `
     SELECT [System.Id]
     FROM WorkItems
     WHERE [System.WorkItemType] IN ('User Story', 'Bug')
-      AND [System.AreaPath] UNDER 'TecOrder\\Returns'
-      AND [System.IterationPath] UNDER 'TecOrder\\Returns'
+      AND [System.AreaPath] UNDER '${areaPath}'
+      AND [System.IterationPath] UNDER '${areaPath}'
     ORDER BY [Microsoft.VSTS.Common.BacklogPriority] ASC
   `;
-
   const result = await adoFetch(api('wit/wiql?api-version=7.1'), {
     method: 'POST',
     body: JSON.stringify({ query: wiql }),
@@ -159,19 +257,43 @@ export async function getStoriesWithDevelopers(): Promise<WorkItem[]> {
   if (!ids.length) return [];
 
   const items = await getWorkItemsBatch(ids);
-  const allItems: WorkItem[] = [];
 
-  for (const raw of items) {
-    const item = await parseWorkItem(raw);
-    item.developer = await resolveDeveloper(item, raw.relations || []);
+  // Filter to only items from maxDemoSprint onward BEFORE resolving children
+  const relevantItems = items.filter((raw: any) => {
+    const iterPath: string = raw.fields['System.IterationPath'] || '';
+    const match = iterPath.match(/Sprint (\d+)/i);
+    return match && parseInt(match[1]) >= maxDemoSprint;
+  });
+
+  // Collect child IDs for developer resolution
+  const allChildIds: number[] = [];
+  for (const raw of relevantItems) {
+    const childLinks = (raw.relations || []).filter(
+      (r: any) => r.rel === 'System.LinkTypes.Hierarchy-Forward'
+    );
+    for (const link of childLinks) {
+      const parts = link.url.split('/');
+      allChildIds.push(parseInt(parts[parts.length - 1]));
+    }
+  }
+
+  const childrenMap = new Map<number, any>();
+  if (allChildIds.length) {
+    const children = await getWorkItemsBatch(allChildIds);
+    for (const child of children) childrenMap.set(child.id, child);
+  }
+
+  // Parse and filter
+  const allItems: WorkItem[] = [];
+  for (const raw of relevantItems) {
+    const item = parseWorkItem(raw);
+    item.developer = resolveDeveloper(item, raw.relations || [], childrenMap);
     allItems.push(item);
   }
 
-  const demoSprints = allItems.filter(i => i.tags.includes('demo')).map(i => i.sprintNumber);
-  const minDemoSprint = demoSprints.length ? Math.min(...demoSprints) : 0;
-
+  // Include all items from maxDemoSprint onward
+  // Demo-tagged items from the demo sprint will be shown as grayed out in the UI
   return allItems
-    .filter(i => i.sprintNumber >= minDemoSprint)
     .sort((a, b) => a.sprintNumber - b.sprintNumber || a.boardPriority - b.boardPriority);
 }
 
@@ -181,11 +303,7 @@ export async function addDemoTag(ids: number[]): Promise<void> {
     await adoFetch(api(`wit/workitems/${id}?api-version=7.1`), {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json-patch+json' },
-      body: JSON.stringify([{
-        op: 'add',
-        path: '/fields/System.Tags',
-        value: await getTagsWithDemo(id),
-      }]),
+      body: JSON.stringify([{ op: 'add', path: '/fields/System.Tags', value: await getTagsWithDemo(id) }]),
     });
   }
 }
@@ -196,11 +314,7 @@ export async function removeDemoTag(ids: number[]): Promise<void> {
     await adoFetch(api(`wit/workitems/${id}?api-version=7.1`), {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json-patch+json' },
-      body: JSON.stringify([{
-        op: 'add',
-        path: '/fields/System.Tags',
-        value: await getTagsWithoutDemo(id),
-      }]),
+      body: JSON.stringify([{ op: 'add', path: '/fields/System.Tags', value: await getTagsWithoutDemo(id) }]),
     });
   }
 }

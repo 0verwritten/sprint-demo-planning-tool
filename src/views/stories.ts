@@ -1,6 +1,5 @@
 import { WorkItem } from '../ado.js';
 
-const stateOrder: Record<string, number> = { Done: 0, Tested: 1, Committed: 2, Approved: 3 };
 const stateColor: Record<string, string> = {
   Done: 'bg-green-100 text-green-800',
   Tested: 'bg-blue-100 text-blue-800',
@@ -8,69 +7,71 @@ const stateColor: Record<string, string> = {
   Approved: 'bg-purple-100 text-purple-800',
 };
 
-export function storiesView(items: WorkItem[]): string {
+export function storiesPageView(items: WorkItem[]): string {
+  if (!items.length) return '<div class="text-gray-500">No stories found for demo planning.</div>';
+
   // Group by sprint
-  const groups = new Map<string, WorkItem[]>();
+  const groups = new Map<number, WorkItem[]>();
   for (const item of items) {
-    const key = item.sprint || 'No Sprint';
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key)!.push(item);
+    if (!groups.has(item.sprintNumber)) groups.set(item.sprintNumber, []);
+    groups.get(item.sprintNumber)!.push(item);
   }
 
-  // Sort within each group by state priority then board priority
-  for (const [, list] of groups) {
-    list.sort((a, b) => (stateOrder[a.state] ?? 99) - (stateOrder[b.state] ?? 99) || a.boardPriority - b.boardPriority);
-  }
+  const sortedSprints = [...groups.keys()].sort((a, b) => a - b);
 
   let html = `
-    <form hx-post="/finalize" hx-target="#content" hx-swap="innerHTML">
-      <div class="flex gap-3 mb-4">
+    <form action="/finalize" method="POST">
+      <div class="flex gap-3 mb-4 sticky top-0 bg-gray-50 py-2 z-10 border-b">
         <button type="submit" class="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700">
-          Finalize & Export
+          Finalize & Export Excel
         </button>
-      </div>`;
+        <button type="submit" formaction="/export-only" class="bg-gray-600 text-white px-4 py-2 rounded hover:bg-gray-700">
+          Export Only (no tag changes)
+        </button>
+        <span class="text-sm text-gray-500 self-center">${items.length} items across ${sortedSprints.length} sprints</span>
+      </div>
+      <div class="space-y-3">`;
 
-  for (const [sprint, list] of groups) {
-    const sprintLabel = sprint.split('\\').pop() || sprint;
+  for (const sprintNum of sortedSprints) {
+    const list = groups.get(sprintNum)!;
     html += `
-      <div class="mb-6">
-        <h2 class="text-lg font-semibold border-b pb-1 mb-2">${sprintLabel}</h2>
-        <div class="space-y-1">`;
+        <details class="border rounded" open>
+          <summary class="px-4 py-2 bg-gray-100 font-medium cursor-pointer hover:bg-gray-200 select-none">
+            Sprint ${sprintNum} <span class="text-sm text-gray-500 font-normal">(${list.length} items)</span>
+          </summary>
+          <div class="px-4 py-2 space-y-1">`;
 
     for (const item of list) {
-      const hasDemo = item.tags.includes('demo');
-      const checked = hasDemo ? 'checked' : '';
+      const isDemo = item.tags.includes('demo');
+      const checked = '';  // never pre-check; demo items shown as grayed only
       const badge = stateColor[item.state] || 'bg-gray-100 text-gray-800';
       const typeBadge = item.type === 'Bug' ? 'bg-red-100 text-red-700' : 'bg-indigo-100 text-indigo-700';
+      const rowClass = isDemo ? 'opacity-50' : '';
 
       html += `
-          <label class="flex items-center gap-3 p-2 rounded hover:bg-gray-100 cursor-pointer">
-            <input type="checkbox" name="selected" value="${item.id}" ${checked}
-              class="w-4 h-4 rounded border-gray-300">
-            <span class="text-xs px-1.5 py-0.5 rounded font-medium ${typeBadge}">${item.type === 'Bug' ? 'Bug' : 'Story'}</span>
-            <span class="text-xs px-1.5 py-0.5 rounded font-medium ${badge}">${item.state}</span>
-            <a href="${item.url}" target="_blank" class="text-blue-600 hover:underline flex-1 truncate">
-              ${item.id}: ${escapeHtml(item.title)}
-            </a>
-            <span class="text-xs text-gray-500">${escapeHtml(item.developer || item.assignedTo)}</span>
-          </label>`;
+            <label class="flex items-center gap-3 p-2 rounded hover:bg-gray-50 cursor-pointer ${rowClass}">
+              <input type="checkbox" name="selected" value="${item.id}"
+                class="w-4 h-4 rounded border-gray-300">
+              <span class="text-xs px-1.5 py-0.5 rounded font-medium ${typeBadge}">${item.type === 'Bug' ? 'Bug' : 'Story'}</span>
+              <span class="text-xs px-1.5 py-0.5 rounded font-medium ${badge}">${item.state}</span>
+              <a href="${item.url}" target="_blank" class="text-blue-600 hover:underline flex-1 truncate"
+                onclick="event.stopPropagation()">
+                ${item.id}: ${escapeHtml(item.title)}
+              </a>
+              ${isDemo ? '<span class="text-xs text-gray-400 italic shrink-0">demoed</span>' : ''}
+              <span class="text-xs text-gray-500 shrink-0">${escapeHtml(item.developer || item.assignedTo)}</span>
+            </label>`;
     }
 
     html += `
-        </div>
-      </div>`;
+          </div>
+        </details>`;
   }
 
-  html += '</form>';
+  html += `
+      </div>
+    </form>`;
   return html;
-}
-
-export function resultView(message: string): string {
-  return `
-    <div class="p-4 bg-green-50 border border-green-200 rounded">
-      <p class="text-green-800 font-medium">${message}</p>
-      <a href="/" class="text-blue-600 hover:underline mt-2 inline-block">← Back to list</a>
-    </div>`;
 }
 
 function escapeHtml(s: string): string {
