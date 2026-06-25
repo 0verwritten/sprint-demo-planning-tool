@@ -23,7 +23,7 @@ app.get('/', async (c) => {
 // Finalize: update tags and export Excel
 app.post('/finalize', async (c) => {
   try {
-    const body = await c.req.parseBody();
+    const body = await c.req.parseBody({ all: true });
     const raw = body['selected'];
     const selectedIds: number[] = (Array.isArray(raw) ? raw : raw ? [raw] : [])
       .map(id => parseInt(id as string));
@@ -52,7 +52,7 @@ app.post('/finalize', async (c) => {
 // Export only: generate Excel without modifying tags
 app.post('/export-only', async (c) => {
   try {
-    const body = await c.req.parseBody();
+    const body = await c.req.parseBody({ all: true });
     const raw = body['selected'];
     const selectedIds: number[] = (Array.isArray(raw) ? raw : raw ? [raw] : [])
       .map(id => parseInt(id as string));
