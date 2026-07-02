@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "build": "node build.js",
-    "start": "node dist/bundle.cjs"
+    "start": "node dist/bundle.cjs",
+    "test": "vitest run"
   },
   "dependencies": {
     "@hono/node-server": "1.13.8",
@@ -19,6 +20,7 @@
     "esbuild": "0.28.1",
     "pkg": "5.8.1",
     "tsx": "4.19.2",
-    "typescript": "5.7.2"
+    "typescript": "5.7.2",
+    "vitest": "^4.1.9"
   }
 }
