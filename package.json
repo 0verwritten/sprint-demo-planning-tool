@@ -1,6 +1,7 @@
 {
   "name": "sprint-demo-planner",
   "version": "1.0.0",
+  "author": "Vlad Moiseienko <42748460+0verwritten@users.noreply.github.com> (https://github.com/0verwritten)",
   "type": "module",
   "scripts": {
     "dev": "tsx src/index.ts",
