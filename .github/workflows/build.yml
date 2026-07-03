@@ -36,7 +36,9 @@ jobs:
         run: npx pkg dist/bundle.cjs --targets node18-win-x64 --output exe/sprint-demo-planner.exe
 
       - name: Copy .env.example to exe folder
-        run: copy .env.example exe\.env.example
+        run: |
+          if (!(Test-Path exe)) { New-Item -ItemType Directory -Path exe }
+          Copy-Item .env.example exe\.env.example
 
       - name: Upload exe artifact
         uses: actions/upload-artifact@v4
