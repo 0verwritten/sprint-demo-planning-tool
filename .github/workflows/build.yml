@@ -1,0 +1,45 @@
+name: Build EXE
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Bundle with esbuild
+        run: npx esbuild src/index.ts --bundle --platform=node --format=cjs --outfile=dist/bundle.cjs
+
+      - name: Package into exe
+        run: npx pkg dist/bundle.cjs --targets node18-win-x64 --output exe/sprint-demo-planner.exe
+
+      - name: Copy .env.example to exe folder
+        run: copy .env.example exe\.env.example
+
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sprint-demo-planner
+          path: exe/
